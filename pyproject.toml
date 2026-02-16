@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Simple interface to pretrained speech encoders"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
 authors = [{ name = "Maxime Poli" }]
 dependencies = [
   "fsspec[http]>=2026.2.0",
