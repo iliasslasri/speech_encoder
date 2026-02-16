@@ -71,6 +71,14 @@ class HuBERT(nn.Module):
         """Register a forward hook to match fairseq behavior (different from torchaudio and huggingface transformers).
 
         Extract hidden state just after the feed_forward, before layer_norm and residual.
+        References:
+            fairseq:
+                - https://github.com/facebookresearch/fairseq/blob/main/fairseq/models/wav2vec/wav2vec2.py#L1135
+                - https://github.com/facebookresearch/fairseq/blob/main/fairseq/models/wav2vec/wav2vec2.py#L1329-L1375
+            torchaudio:
+                - https://github.com/pytorch/audio/blob/main/src/torchaudio/models/wav2vec2/components.py#L445-L463
+            transformers:
+                - https://github.com/huggingface/transformers/blob/main/src/transformers/models/hubert/modeling_hubert.py#L418-L477
         """
         if self._hidden_state is not None:
             raise ValueError("Hidden state should be 'None' at this stage. Did not get cleaned up")

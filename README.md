@@ -55,6 +55,15 @@ Available configurations:
 from speech_encoder import SpeechEncoder
 
 print(SpeechEncoder.available_checkpoints())
+#AvailableConfig(name='hubert-base-ls960', layer=6, vocab_size=50, kind_kmeans='kmeans')
+#AvailableConfig(name='hubert-base-ls960', layer=6, vocab_size=100, kind_kmeans='kmeans')
+#AvailableConfig(name='hubert-base-ls960', layer=6, vocab_size=200, kind_kmeans='kmeans')
+#AvailableConfig(name='hubert-base-ls960', layer=6, vocab_size=500, kind_kmeans='kmeans')
+#AvailableConfig(name='hubert-base-ls960', layer=9, vocab_size=500, kind_kmeans='kmeans')
+#AvailableConfig(name='hubert-base-ls960', layer=9, vocab_size=2000, kind_kmeans='kmeans-expresso')
+#AvailableConfig(name='mhubert-base-vp_en_es_fr', layer=11, vocab_size=1000, kind_kmeans='kmeans')
+#AvailableConfig(name='mhubert-base-vp_mls_cv_8lang', layer=12, vocab_size=2000, kind_kmeans='kmeans')
+#AvailableConfig(name='mhubert-base-vp_mls_cv_8lang', layer=12, vocab_size=2000, kind_kmeans='kmeans-expresso')
 ```
 
 With custom SSL model and quantizer:
