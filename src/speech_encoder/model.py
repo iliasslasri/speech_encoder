@@ -1,0 +1,206 @@
+from pathlib import Path
+from typing import Any, Literal, NamedTuple, TypedDict, overload
+
+import fsspec
+import joblib
+import numpy as np
+import torch
+from jaxtyping import Float, Int64
+from sklearn.cluster import KMeans
+from torch import Tensor, nn
+from torchaudio.models import Wav2Vec2Model, hubert_base
+
+from .assets import load_hubert_fairseq_state_dict, match_name_or_path_with_textlesslib_names, textlesslib_checkpoints
+
+
+class KMeansQuantizer(nn.Module):
+    def __init__(self, fitted_kmeans: KMeans) -> None:
+        super().__init__()
+        self._kmeans = fitted_kmeans
+
+    @property
+    def n_clusters(self) -> int:
+        return self._kmeans.n_clusters
+
+    @property
+    def cluster_centers(self) -> Float[Tensor, "k dim"]:
+        return torch.from_numpy(self._kmeans.cluster_centers_)
+
+    @overload
+    def forward(self, x: Float[Tensor, "batch seq dim"]) -> Int64[Tensor, "batch seq"]: ...
+
+    @overload
+    def forward(self, x: Float[Tensor, "seq dim"]) -> Int64[Tensor, " seq"]: ...
+
+    @torch.inference_mode()
+    def forward(self, x):
+        x_np = x.cpu().numpy()
+        match x.ndim:
+            case 2:
+                predictions = self._kmeans.predict(x_np)
+            case 3:
+                predictions = np.stack([self._kmeans.predict(y) for y in x_np])
+            case _:
+                raise ValueError(f"Invalid number of dimensions: {x.ndim}")
+        return torch.from_numpy(predictions).to(x.device)
+
+    @classmethod
+    def from_pretrained(cls, name_or_path: str | Path) -> "KMeansQuantizer":
+        path = match_name_or_path_with_textlesslib_names(name_or_path)
+        with fsspec.open(str(path), "rb") as f:
+            return KMeansQuantizer(joblib.load(f))
+
+    @classmethod
+    def available_checkpoints(cls) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name in textlesslib_checkpoints()
+            if "kmeans" in name and "tacotron" not in name and "hifigan" not in name
+        )
+
+
+class HuBERT(nn.Module):
+    def __init__(self, pretrained_hubert: Wav2Vec2Model, *, layer: int) -> None:
+        super().__init__()
+        self.layer = layer
+        self.model = pretrained_hubert
+        self._hidden_state: torch.Tensor | None = None
+        self.model.encoder.transformer.layers[layer - 1].feed_forward.register_forward_hook(self._hook)  # ty:ignore[unresolved-attribute, not-subscriptable]
+
+    def _hook(self, _: nn.Module, __: tuple[Any, ...], output: torch.Tensor) -> None:
+        """Register a forward hook to match fairseq behavior (different from torchaudio and huggingface transformers).
+
+        Extract hidden state just after the feed_forward, before layer_norm and residual.
+        """
+        if self._hidden_state is not None:
+            raise ValueError("Hidden state should be 'None' at this stage. Did not get cleaned up")
+        self._hidden_state = output.detach()
+
+    @overload
+    def forward(
+        self,
+        waveforms: Float[Tensor, "batch time"],
+        lengths: None,
+    ) -> tuple[Float[Tensor, "batch seq"], None]: ...
+
+    @overload
+    def forward(
+        self,
+        waveforms: Float[Tensor, "batch time"],
+        lengths: Int64[Tensor, " batch"],
+    ) -> tuple[Float[Tensor, "batch seq"], Int64[Tensor, " batch"]]: ...
+
+    @torch.inference_mode()
+    def forward(self, waveforms, lengths=None):
+        _, output_lengths = self.model.extract_features(waveforms, lengths, num_layers=self.layer)
+        hidden_state = self._hidden_state
+        if hidden_state is None:
+            raise ValueError("Hidden state has not been set, forward hook failure.")
+        self._hidden_state = None
+        return hidden_state, output_lengths
+
+    @classmethod
+    def from_pretrained(cls, name_or_path: str | Path, *, layer: int) -> "HuBERT":
+        path = match_name_or_path_with_textlesslib_names(name_or_path)
+        state_dict = load_hubert_fairseq_state_dict(path)
+        pretrained_hubert = hubert_base().eval()
+        pretrained_hubert.load_state_dict(state_dict)
+        return HuBERT(pretrained_hubert, layer=layer)
+
+    @classmethod
+    def available_checkpoints(cls) -> tuple[str, ...]:
+        return ("hubert-base-ls960", "mhubert-base-vp_en_es_fr", "mhubert-base-vp_mls_cv_8lang")
+
+
+class AvailableConfig(NamedTuple):
+    name: str
+    layer: int
+    vocab_size: int
+    kind_kmeans: Literal["kmeans", "kmeans-expresso"]
+
+
+class DiscreteUnits(TypedDict):
+    units: list[int]
+    counts: list[int]
+
+
+class SpeechEncoder(nn.Module):
+    def __init__(self, dense: nn.Module, quantizer: nn.Module, *, deduplicate: bool) -> None:
+        super().__init__()
+        self.dense = dense
+        self.quantizer = quantizer
+        self.deduplicate = deduplicate
+
+    @overload
+    def forward(
+        self,
+        waveforms: Float[Tensor, "batch time"],
+        lengths: Int64[Tensor, " batch"] | None,
+        *,
+        formatted: Literal[True],
+    ) -> list[DiscreteUnits]: ...
+
+    @overload
+    def forward(
+        self,
+        waveforms: Float[Tensor, "batch time"],
+        lengths: Int64[Tensor, " batch"],
+        *,
+        formatted: Literal[False],
+    ) -> tuple[Float[Tensor, "batch seq"], Int64[Tensor, " batch"]]: ...
+
+    @overload
+    def forward(
+        self,
+        waveforms: Float[Tensor, "batch time"],
+        lengths: None,
+        *,
+        formatted: Literal[False],
+    ) -> tuple[Float[Tensor, "batch seq"], None]: ...
+
+    def forward(self, waveforms, lengths=None, *, formatted=True):
+        hidden_state, lengths = self.dense(waveforms, lengths)
+        units = self.quantizer(hidden_state)
+        if not formatted:
+            if lengths is not None:
+                mask = torch.arange(units.shape[-1]).unsqueeze(0) >= lengths.unsqueeze(1)
+                units[mask] = -1
+            return units, lengths
+        if lengths is None:
+            lengths = torch.full(size=(units.shape[0],), fill_value=units.shape[1])
+        if self.deduplicate:
+            output = [torch.unique_consecutive(u[:n], return_counts=True) for u, n in zip(units, lengths, strict=True)]
+        else:
+            output = [(u[:n], torch.ones(n, dtype=torch.int64)) for u, n in zip(units, lengths, strict=True)]
+        return [{"units": u.tolist(), "counts": c.tolist()} for u, c in output]
+
+    @classmethod
+    def from_textlesslib(
+        cls,
+        name: str,
+        *,
+        layer: int,
+        vocab_size: int,
+        deduplicate: bool,
+        kind_kmeans: Literal["kmeans", "kmeans-expresso"] = "kmeans",
+    ) -> "SpeechEncoder":
+        if (name, layer, vocab_size, kind_kmeans) not in cls.available_checkpoints():
+            available = "\n".join(str(c) for c in cls.available_checkpoints())
+            raise ValueError(f"Invalid combination of arguments. Pick one of:\n{available}")
+        hubert = HuBERT.from_pretrained(name, layer=layer)
+        kmeans = KMeansQuantizer.from_pretrained(f"{name}-layer-{layer}-{kind_kmeans}-{vocab_size}")
+        return SpeechEncoder(hubert, kmeans, deduplicate=deduplicate).eval()
+
+    @classmethod
+    def available_checkpoints(cls) -> tuple[AvailableConfig, ...]:
+        return (
+            AvailableConfig("hubert-base-ls960", 6, 50, "kmeans"),
+            AvailableConfig("hubert-base-ls960", 6, 100, "kmeans"),
+            AvailableConfig("hubert-base-ls960", 6, 200, "kmeans"),
+            AvailableConfig("hubert-base-ls960", 6, 500, "kmeans"),
+            AvailableConfig("hubert-base-ls960", 9, 500, "kmeans"),
+            AvailableConfig("hubert-base-ls960", 9, 2000, "kmeans-expresso"),
+            AvailableConfig("mhubert-base-vp_en_es_fr", 11, 1000, "kmeans"),
+            AvailableConfig("mhubert-base-vp_mls_cv_8lang", 12, 2000, "kmeans"),
+            AvailableConfig("mhubert-base-vp_mls_cv_8lang", 12, 2000, "kmeans-expresso"),
+        )
