@@ -10,6 +10,7 @@ from sklearn.cluster import KMeans
 from torch import Tensor, nn
 from torchaudio.models import Wav2Vec2Model, hubert_base
 
+import torch.nn.functional as F
 from .assets import load_hubert_fairseq_state_dict, match_name_or_path_with_textlesslib_names, textlesslib_checkpoints
 
 
@@ -120,6 +121,79 @@ class HuBERT(nn.Module):
         return ("hubert-base-ls960", "mhubert-base-vp_en_es_fr", "mhubert-base-vp_mls_cv_8lang")
 
 
+class SpidRWrapper(nn.Module):
+    def __init__(self, model_name: str, *, layer: int) -> None:
+        super().__init__()
+        self.model_name = model_name
+        self.layer = layer
+        self.model = torch.hub.load("facebookresearch/spidr", model_name)
+        self.conv_layer_config = [(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512, 2, 2)] * 2
+
+    @staticmethod
+    def conv_length(lengths: Tensor, conv_layer_config: list[tuple[int, int, int]]) -> Tensor:
+        for _, kernel_size, stride in conv_layer_config:
+            # handle float or int
+            lengths = torch.div(lengths - kernel_size, stride, rounding_mode="floor") + 1
+            lengths = torch.max(torch.zeros_like(lengths), lengths)
+        return lengths
+
+    def forward(self, waveforms: Tensor, lengths: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+        # Normalize: SpidR expects standardized audio (mean 0, var 1)
+        # waveforms is [batch, time]
+        waveforms = F.layer_norm(waveforms, (waveforms.shape[-1],))
+        
+        feats = self.model.feature_extractor(waveforms)
+        feats = self.model.feature_projection(feats)
+        
+        # Get intermediate outputs from student model
+        # layer is 1-indexed, get_intermediate_outputs expects num_layers
+        hidden_states = self.model.student.get_intermediate_outputs(feats, num_layers=self.layer)
+        hidden_state = hidden_states[-1]
+
+        if lengths is not None:
+             lengths = self.conv_length(lengths, self.conv_layer_config)
+        
+        return hidden_state, lengths
+
+
+class SpidRQuantizer(nn.Module):
+    def __init__(self, spidr_model: nn.Module) -> None:
+        super().__init__()
+        self.model = spidr_model
+        self.conv_layer_config = [(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512, 2, 2)] * 2
+
+    @torch.inference_mode()
+    def forward(self, waveforms: Tensor, lengths: Tensor | None = None) -> Tensor:
+        # Standardize audio
+        waveforms = F.layer_norm(waveforms, (waveforms.shape[-1],))
+        
+        attention_mask = None
+        if lengths is not None:
+            ds_lengths = SpidRWrapper.conv_length(lengths, self.conv_layer_config)
+            
+            with torch.no_grad():
+                feats = self.model.feature_extractor(waveforms)
+                max_len = feats.shape[1]
+            
+            padding_mask = torch.arange(max_len, device=lengths.device).expand(lengths.shape[0], max_len) >= ds_lengths[:, None]
+            attention_mask = ~padding_mask[:, None, None, :].expand(lengths.shape[0], 1, max_len, max_len)
+
+        # get_codebooks returns list of [batch, seq, vocab] probabilities when onehot=False
+        codeprobs_list = self.model.get_codebooks(waveforms, attention_mask=attention_mask, onehot=False)
+        
+        valid_codeprobs = [c for c in codeprobs_list if c is not None]
+        if not valid_codeprobs:
+            raise ValueError("No valid codebooks returned from SpidR model.")
+        
+        last_codebook = valid_codeprobs[-1]
+        
+        if last_codebook.ndim == 2: # [seq, vocab] if batch_size=1
+             last_codebook = last_codebook.unsqueeze(0)
+             
+        units = last_codebook.argmax(dim=-1) # [batch, seq]
+        return units
+
+
 class AvailableConfig(NamedTuple):
     name: str
     layer: int
@@ -168,18 +242,22 @@ class SpeechEncoder(nn.Module):
 
     def forward(self, waveforms, lengths=None, *, formatted=True):
         hidden_state, lengths = self.dense(waveforms, lengths)
-        units = self.quantizer(hidden_state)
+        if isinstance(self.quantizer, SpidRQuantizer):
+            units = self.quantizer(waveforms, lengths)
+        else:
+            units = self.quantizer(hidden_state)
+
         if not formatted:
             if lengths is not None:
                 mask = torch.arange(units.shape[-1]).unsqueeze(0) >= lengths.unsqueeze(1)
                 units[mask] = -1
             return units, lengths
         if lengths is None:
-            lengths = torch.full(size=(units.shape[0],), fill_value=units.shape[1])
+            lengths = torch.full(size=(units.shape[0],), fill_value=units.shape[1], device=units.device)
         if self.deduplicate:
-            output = [torch.unique_consecutive(u[:n], return_counts=True) for u, n in zip(units, lengths, strict=True)]
+            output = [torch.unique_consecutive(u[:n], return_counts=True) for u, n in zip(units, lengths.tolist(), strict=True)]
         else:
-            output = [(u[:n], torch.ones(n, dtype=torch.int64)) for u, n in zip(units, lengths, strict=True)]
+            output = [(u[:n], torch.ones(n, dtype=torch.int64)) for u, n in zip(units, lengths.tolist(), strict=True)]
         return [{"units": u.tolist(), "counts": c.tolist()} for u, c in output]
 
     @classmethod
@@ -190,17 +268,22 @@ class SpeechEncoder(nn.Module):
         layer: int,
         vocab_size: int,
         deduplicate: bool,
-        kind_kmeans: Literal["kmeans", "kmeans-expresso"] = "kmeans",
+        kind_kmeans: str = "kmeans",
     ) -> "SpeechEncoder":
-        if (name, layer, vocab_size, kind_kmeans) not in cls.available_checkpoints():
-            available = "\n".join(str(c) for c in cls.available_checkpoints())
+        if name.startswith("spidr") or name.startswith("dinosr"):
+            model = SpidRWrapper(name, layer=layer)
+            quantizer = SpidRQuantizer(model.model)
+            return SpeechEncoder(model, quantizer, deduplicate=deduplicate).eval()
+
+        if (name, layer, vocab_size, kind_kmeans) not in cls.available_checkpoints_list():
+            available = "\n".join(str(c) for c in cls.available_checkpoints_list())
             raise ValueError(f"Invalid combination of arguments. Pick one of:\n{available}")
         hubert = HuBERT.from_pretrained(name, layer=layer)
         kmeans = KMeansQuantizer.from_pretrained(f"{name}-layer-{layer}-{kind_kmeans}-{vocab_size}")
         return SpeechEncoder(hubert, kmeans, deduplicate=deduplicate).eval()
 
     @classmethod
-    def available_checkpoints(cls) -> tuple[AvailableConfig, ...]:
+    def available_checkpoints_list(cls) -> tuple[AvailableConfig, ...]:
         return (
             AvailableConfig("hubert-base-ls960", 6, 50, "kmeans"),
             AvailableConfig("hubert-base-ls960", 6, 100, "kmeans"),
@@ -211,4 +294,12 @@ class SpeechEncoder(nn.Module):
             AvailableConfig("mhubert-base-vp_en_es_fr", 11, 1000, "kmeans"),
             AvailableConfig("mhubert-base-vp_mls_cv_8lang", 12, 2000, "kmeans"),
             AvailableConfig("mhubert-base-vp_mls_cv_8lang", 12, 2000, "kmeans-expresso"),
+            # SpidR / DinoSR
+            AvailableConfig("spidr_base", 6, 256, "spidr"),
+            AvailableConfig("dinosr_base_reproduced", 6, 256, "spidr"),
+            AvailableConfig("dinosr_base_original", 6, 256, "spidr"),
         )
+
+    @classmethod
+    def available_checkpoints(cls) -> tuple[AvailableConfig, ...]:
+        return cls.available_checkpoints_list()
