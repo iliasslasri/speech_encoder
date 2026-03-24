@@ -157,9 +157,10 @@ class SpidRWrapper(nn.Module):
 
 
 class SpidRQuantizer(nn.Module):
-    def __init__(self, spidr_model: nn.Module) -> None:
+    def __init__(self, spidr_model: nn.Module, *, layer: int) -> None:
         super().__init__()
         self.model = spidr_model
+        self.layer = layer  # 1-indexed, matches SpidRWrapper convention
         self.conv_layer_config = [(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512, 2, 2)] * 2
 
     @torch.inference_mode()
@@ -185,12 +186,21 @@ class SpidRQuantizer(nn.Module):
         if not valid_codeprobs:
             raise ValueError("No valid codebooks returned from SpidR model.")
         
-        last_codebook = valid_codeprobs[-1]
+        # codeprobs_list is layer-indexed (0-based). self.layer is 1-indexed.
+        # Layers without a codebook are None; index directly to respect the configured layer.
+        layer_idx = self.layer - 1
+        if layer_idx >= len(codeprobs_list) or codeprobs_list[layer_idx] is None:
+            available = [i + 1 for i, c in enumerate(codeprobs_list) if c is not None]
+            raise ValueError(
+                f"Layer {self.layer} does not have a codebook in this SpidR model. "
+                f"Available codebook layers: {available}"
+            )
+        target_codebook = codeprobs_list[layer_idx]
         
-        if last_codebook.ndim == 2: # [seq, vocab] if batch_size=1
-             last_codebook = last_codebook.unsqueeze(0)
+        if target_codebook.ndim == 2: # [seq, vocab] if batch_size=1
+             target_codebook = target_codebook.unsqueeze(0)
              
-        units = last_codebook.argmax(dim=-1) # [batch, seq]
+        units = target_codebook.argmax(dim=-1) # [batch, seq]
         return units
 
 
@@ -272,7 +282,7 @@ class SpeechEncoder(nn.Module):
     ) -> "SpeechEncoder":
         if name.startswith("spidr") or name.startswith("dinosr"):
             model = SpidRWrapper(name, layer=layer)
-            quantizer = SpidRQuantizer(model.model)
+            quantizer = SpidRQuantizer(model.model, layer=layer)
             return SpeechEncoder(model, quantizer, deduplicate=deduplicate).eval()
 
         if (name, layer, vocab_size, kind_kmeans) not in cls.available_checkpoints_list():
