@@ -296,8 +296,8 @@ class SpeechEncoder(nn.Module):
             AvailableConfig("mhubert-base-vp_mls_cv_8lang", 12, 2000, "kmeans-expresso"),
             # SpidR / DinoSR
             AvailableConfig("spidr_base", 6, 256, "spidr"),
-            AvailableConfig("dinosr_base_reproduced", 6, 256, "spidr"),
-            AvailableConfig("dinosr_base_original", 6, 256, "spidr"),
+            AvailableConfig("dinosr_base_reproduced", 5, 256, "spidr"),
+            AvailableConfig("dinosr_base_original", 5, 256, "spidr"),
         )
 
     @classmethod
